@@ -1,0 +1,15 @@
+# <type>: <subject> (Max 50 chars)
+
+# <body> (Explain why this change is being made)
+
+# <footer> (References, links, ticket numbers)
+
+# Type can be:
+#   feat     (new feature)
+#   fix      (bug fix)
+#   docs     (documentation)
+#   style    (formatting, missing semi colons, etc)
+#   refactor (refactoring code)
+#   test     (adding tests)
+#   chore    (maintain)
+#   deploy   (deployment related)
