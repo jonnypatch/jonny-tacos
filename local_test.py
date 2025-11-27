@@ -1,6 +1,8 @@
 """
 Local Test - Full interactive CLI for IT Support Bot
 Tests: LangChain routing, GPT responses, QuickBase ticket creation
+
+Updated for new support_chain.py response format.
 """
 
 import json
@@ -77,6 +79,8 @@ class ITBotCLI:
             print("  ✅ LangChain support chain")
         except Exception as e:
             print(f"  ❌ Chain failed: {e}")
+            import traceback
+            traceback.print_exc()
             self.chain = None
         
         # Initialize QuickBase
@@ -105,6 +109,7 @@ class ITBotCLI:
   /stats            Show ticket statistics
   /test-qb          Test QuickBase connection
   /test-create      Test creating a ticket directly (bypasses chain)
+  /test-gpt         Test GPT connection directly
   /help             Show this help
   /quit             Exit
 
@@ -139,6 +144,10 @@ class ITBotCLI:
             await self.test_create_ticket()
             return
         
+        if message.lower() == "/test-gpt":
+            await self.test_gpt()
+            return
+        
         if message.lower() == "/stats":
             await self.show_stats()
             return
@@ -160,10 +169,50 @@ class ITBotCLI:
         # Regular message - process through chain
         await self.handle_support_question(message)
     
+    async def test_gpt(self) -> None:
+        """Test GPT connection directly"""
+        print("\n⏳ Testing GPT connection...")
+        
+        endpoint = os.getenv("GPT5_ENDPOINT", "")
+        api_key = os.getenv("GPT5_API_KEY", "")
+        model = os.getenv("GPT5_MODEL", "gpt-4")
+        
+        print(f"   Endpoint: {endpoint[:50]}..." if endpoint else "   Endpoint: NOT SET")
+        print(f"   Model: {model}")
+        print(f"   API Key: {'*' * 10}..." if api_key else "   API Key: NOT SET")
+        
+        if not endpoint or not api_key:
+            print("\n❌ Missing GPT5_ENDPOINT or GPT5_API_KEY")
+            return
+        
+        try:
+            from langchain_openai import ChatOpenAI
+            from langchain_core.messages import HumanMessage
+            
+            # Use older parameter names for langchain-openai==0.0.5 compatibility
+            llm = ChatOpenAI(
+                model=model,
+                temperature=0.3,
+                openai_api_base=endpoint,   # Old name for custom endpoint
+                openai_api_key=api_key,     # Old name for API key
+                request_timeout=30,
+                max_retries=2,
+            )
+            
+            print("\n   Sending test message...")
+            response = llm.invoke([HumanMessage(content="Say 'GPT connection working!' in exactly those words.")])
+            
+            print(f"\n✅ GPT Response: {response.content}")
+            
+        except Exception as e:
+            print(f"\n❌ GPT test failed: {e}")
+            import traceback
+            traceback.print_exc()
+    
     async def handle_support_question(self, question: str) -> None:
         """Process IT support question through full pipeline"""
         
-        print("\n⏳ Processing...")
+        print("\n⏳ Processing through LangChain...")
         
         if not self.chain:
             print("❌ Chain not initialized")
@@ -174,119 +223,132 @@ class ITBotCLI:
             result = self.chain.process(question)
             
             print("\n" + "-"*60)
-            print(f"🎯 Intent: {result.get('type')}")
+            print(f"🎯 Response Type: {result.get('type')}")
+            print(f"📊 Confidence: {result.get('confidence', 0):.0%}")
+            print(f"📁 Category: {result.get('category', 'Unknown')}")
+            print(f"⚡ Priority: {result.get('priority', 'Unknown')}")
+            print(f"🔧 Needs Human: {result.get('needs_human', False)}")
+            print(f"📚 Sources: {result.get('sources', [])}")
             print("-"*60)
             
-            if result.get('type') == 'solution':
-                # Bot has a solution
-                print(f"\n💡 Solution (confidence: {result.get('confidence', 0):.0%}):\n")
-                print(result.get('solution', 'No solution provided'))
-                
-                # Always create ticket for tracking
-                print("\n📝 Creating ticket for tracking...")
-                ticket = await self.create_ticket_from_result(
-                    question, 
-                    result,
-                    status="Bot Assisted",
-                    priority="Low"
-                )
-                
-                if ticket:
-                    print(f"\n✅ Ticket created: {ticket.get('ticket_number')}")
-                    print(f"   Status: Bot Assisted (auto-closes in 24h if resolved)")
-                    print(f"   URL: {ticket.get('quickbase_url')}")
-                
-                if result.get('offer_ticket'):
-                    print("\n⚠️  If this doesn't work, reply 'escalate' to raise priority")
+            response_type = result.get('type')
             
-            elif result.get('type') in ['ticket_needed', 'troubleshooting_needed']:
-                # Needs IT help
-                rec = result.get('recommendation', {})
+            if response_type == 'solution':
+                # Bot has a solution - THIS IS THE MAIN PATH
+                solution = result.get('solution', '')
+                confidence = result.get('confidence', 0.5)
+                category = result.get('category', 'General Support')
+                priority = result.get('priority', 'Medium')
+                needs_human = result.get('needs_human', False)
                 
-                print(f"\n🎫 This requires IT assistance:\n")
-                print(f"   Subject:  {rec.get('subject')}")
-                print(f"   Category: {rec.get('category')}")
-                print(f"   Priority: {rec.get('priority')}")
-                print(f"\n   Reason: {rec.get('reasoning', 'Complex issue')}")
+                print(f"\n💡 SOLUTION:\n")
+                print(solution)
+                print()
                 
-                # Create ticket
+                # Determine ticket status based on confidence
+                if needs_human or confidence < 0.5:
+                    ticket_status = "New"
+                    ticket_priority = priority
+                    print("📋 Status: Creating ticket for IT review (low confidence or needs human)")
+                else:
+                    ticket_status = "Bot Assisted"
+                    ticket_priority = "Low"
+                    print("📋 Status: Logging as Bot Assisted (high confidence)")
+                
+                # Create ticket for tracking
                 print("\n📝 Creating ticket...")
                 ticket = await self.create_ticket_from_result(
-                    question,
-                    result,
-                    status="New",
-                    priority=rec.get('priority', 'Medium')
+                    question=question,
+                    solution=solution,
+                    category=category,
+                    priority=ticket_priority,
+                    status=ticket_status,
+                    sources=result.get('sources', []),
+                    confidence=confidence
                 )
                 
                 if ticket:
-                    print(f"\n✅ Ticket created: {ticket.get('ticket_number')}")
-                    print(f"   Assigned to IT queue")
+                    print(f"\n✅ Ticket: {ticket.get('ticket_number')}")
+                    print(f"   Status: {ticket_status}")
+                    print(f"   Priority: {ticket_priority}")
                     print(f"   URL: {ticket.get('quickbase_url')}")
+                
+                if result.get('offer_ticket') and not needs_human:
+                    print("\n💬 If this doesn't help, type 'escalate' or use /ticket")
             
-            elif result.get('type') == 'status_check':
+            elif response_type == 'status_check':
                 ticket_num = result.get('ticket_number')
                 if ticket_num:
                     await self.check_status(ticket_num)
                 else:
                     await self.show_my_tickets()
             
+            elif response_type == 'command':
+                print("ℹ️  This was detected as a command. Use /help for available commands.")
+            
             else:
-                print(f"\n🤷 Unknown response type: {result}")
+                print(f"\n🤷 Unexpected response type: {response_type}")
+                print(f"   Full result: {json.dumps(result, indent=2, default=str)}")
             
             print()
             
         except Exception as e:
-            print(f"\n❌ Error: {e}")
+            print(f"\n❌ Error processing question: {e}")
             import traceback
             traceback.print_exc()
     
     async def create_ticket_from_result(
         self, 
-        question: str, 
-        result: dict,
+        question: str,
+        solution: str,
+        category: str = "General Support",
+        priority: str = "Medium",
         status: str = "New",
-        priority: str = "Medium"
+        sources: list = None,
+        confidence: float = 0.5
     ) -> dict:
         """Create ticket in QuickBase from chain result"""
         
         if not self.qb:
-            print("❌ QuickBase not initialized")
+            print("   ⚠️  QuickBase not initialized - skipping ticket creation")
             return None
         
-        rec = result.get('recommendation', {})
+        # Build description with bot response
+        sources_str = ", ".join(sources) if sources else "GPT General Knowledge"
+        description = f"""**User Question:**
+{question}
+
+---
+**Bot Response (Confidence: {confidence:.0%}):**
+{solution[:500]}{'...' if len(solution) > 500 else ''}
+
+---
+**Sources Used:** {sources_str}
+
+---
+*Auto-generated by IT Support Bot (CLI Test)*"""
         
-        # Build description
-        description = question
-        if result.get('solution'):
-            description += f"\n\n--- Bot Response ---\n{result.get('solution')}"
+        # Generate subject
+        words_to_remove = ['the', 'a', 'an', 'is', 'are', 'i', 'my', 'me', "can't", "cannot"]
+        words = question.lower().split()
+        filtered = [w for w in words if w not in words_to_remove]
+        subject = ' '.join(filtered[:7]).title()[:50] or "IT Support Request"
         
         ticket_data = {
-            'subject': rec.get('subject', question[:50]),
+            'subject': subject,
             'description': description,
             'priority': priority,
-            'category': rec.get('category', result.get('category', 'General Support')),
+            'category': category,
+            'status': status,
             'user_email': self.test_user['email'],
             'user_name': self.test_user['name'],
         }
         
-        print(f"\n   Debug - Ticket data:")
-        print(f"     Subject: {ticket_data['subject']}")
-        print(f"     Category: {ticket_data['category']}")
-        print(f"     Priority: {ticket_data['priority']}")
-        
         try:
             ticket = await self.qb.create_ticket(ticket_data)
-            
-            if ticket:
-                return ticket
-            else:
-                print("❌ QuickBase returned None - check QB logs")
-                return None
-                
+            return ticket
         except Exception as e:
-            print(f"❌ Failed to create ticket: {e}")
-            import traceback
-            traceback.print_exc()
+            print(f"   ❌ Failed to create ticket: {e}")
             return None
     
     async def create_ticket_interactive(self) -> None:
@@ -443,7 +505,7 @@ class ITBotCLI:
             'user_name': self.test_user['name'],
         }
         
-        print(f"\n   Ticket data: {ticket_data}")
+        print(f"\n   Ticket data: {json.dumps(ticket_data, indent=2)}")
         print(f"\n   QB Realm: {self.qb.realm}")
         print(f"   QB Table: {self.qb.table_id}")
         print(f"   QB App: {self.qb.app_id}")
@@ -487,9 +549,87 @@ class ITBotCLI:
 
 
 # ============================================================================
+# Quick Single Test (no interactive loop)
+# ============================================================================
+
+async def quick_test():
+    """Run a single test without interactive mode"""
+    print("\n" + "="*60)
+    print("🧪 Quick Test Mode")
+    print("="*60)
+    
+    # Test GPT
+    print("\n1️⃣  Testing GPT connection...")
+    endpoint = os.getenv("GPT5_ENDPOINT", "")
+    api_key = os.getenv("GPT5_API_KEY", "")
+    model = os.getenv("GPT5_MODEL", "gpt-4")
+    
+    if not endpoint or not api_key:
+        print("   ❌ GPT5_ENDPOINT or GPT5_API_KEY not set!")
+        return
+    
+    print(f"   Endpoint: {endpoint[:40]}...")
+    print(f"   Model: {model}")
+    
+    # Test chain
+    print("\n2️⃣  Initializing chain...")
+    try:
+        chain = ITSupportChain()
+        print("   ✅ Chain initialized")
+    except Exception as e:
+        print(f"   ❌ Chain failed: {e}")
+        import traceback
+        traceback.print_exc()
+        return
+    
+    # Test question
+    print("\n3️⃣  Processing test question...")
+    test_question = "I can't connect to VPN from home"
+    print(f"   Q: {test_question}")
+    
+    try:
+        result = chain.process(test_question)
+        print(f"\n   Type: {result.get('type')}")
+        print(f"   Confidence: {result.get('confidence', 0):.0%}")
+        print(f"   Category: {result.get('category')}")
+        print(f"   Sources: {result.get('sources', [])}")
+        print(f"\n   Solution:\n")
+        solution = result.get('solution', 'No solution')
+        # Indent solution for readability
+        for line in solution.split('\n'):
+            print(f"   {line}")
+        print("\n   ✅ Chain working!")
+    except Exception as e:
+        print(f"   ❌ Chain error: {e}")
+        import traceback
+        traceback.print_exc()
+        return
+    
+    # Test QuickBase (optional)
+    print("\n4️⃣  Testing QuickBase...")
+    try:
+        qb = QuickBaseManager()
+        stats = await qb.get_ticket_statistics()
+        print(f"   ✅ QuickBase connected - {stats.get('total_open', 0)} open tickets")
+    except Exception as e:
+        print(f"   ⚠️  QuickBase not available: {e}")
+    
+    print("\n" + "="*60)
+    print("✅ Quick test complete!")
+    print("="*60)
+
+
+# ============================================================================
 # Main
 # ============================================================================
 
 if __name__ == "__main__":
-    cli = ITBotCLI()
-    asyncio.run(cli.run())
+    import sys
+    
+    if len(sys.argv) > 1 and sys.argv[1] == "--quick":
+        # Quick test mode
+        asyncio.run(quick_test())
+    else:
+        # Interactive mode
+        cli = ITBotCLI()
+        asyncio.run(cli.run())

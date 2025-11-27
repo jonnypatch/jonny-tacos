@@ -4,8 +4,8 @@ Uses LangChain ITSupportChain for routing and response generation.
 
 Flow:
 1. Route via LangChain → Classify intent
-2. Search vector store (or KB) → Get relevant context  
-3. GPT generates response using context
+2. Search vector store + static KB → Get relevant context  
+3. GPT ALWAYS generates response (with or without context)
 4. ALWAYS respond to user with solution
 5. ALWAYS create a ticket for tracking
 """
@@ -158,52 +158,25 @@ async def handle_support_question(
     try:
         # Process through LangChain - this handles routing and response generation
         result = chain.process(question)
-        logging.info(f"Chain result type: {result.get('type')}")
+        logging.info(f"Chain result type: {result.get('type')}, confidence: {result.get('confidence')}")
         
     except Exception as e:
         logging.error(f"Chain processing error: {str(e)}")
         # Fallback - still respond and create ticket
         result = {
             "type": "error",
-            "solution": "I encountered an issue processing your request, but I've logged it for IT to review.",
+            "solution": get_fallback_response(question),
             "category": "General Support",
-            "priority": "Medium"
+            "priority": "Medium",
+            "confidence": 0.3,
+            "needs_human": True
         }
     
-    # Extract response data based on result type
+    # Handle different response types
     response_type = result.get('type')
     
-    if response_type == 'solution':
-        # Quick fix - we have a solution from KB/vector store + GPT
-        solution = result.get('solution', '')
-        confidence = result.get('confidence', 0.8)
-        category = result.get('category', 'General Support')
-        priority = result.get('priority', 'Low')
-        offer_escalate = result.get('offer_ticket', True)
-        ticket_status = 'Bot Assisted'
-        
-    elif response_type == 'ticket_needed':
-        # Router determined this needs IT - but we still respond with context
-        rec = result.get('recommendation', {})
-        solution = f"This issue requires IT assistance.\n\nI've analyzed your request:\n• Category: {rec.get('category', 'General Support')}\n• Priority: {rec.get('priority', 'Medium')}\n• Reason: {rec.get('reasoning', 'Complex issue')}\n\nA ticket has been created for you."
-        confidence = 0.5
-        category = rec.get('category', 'General Support')
-        priority = rec.get('priority', 'Medium')
-        offer_escalate = False  # Already creating a real ticket
-        ticket_status = 'New'
-        
-    elif response_type == 'troubleshooting_needed':
-        # Complex issue - respond with what we know, create ticket
-        rec = result.get('recommendation', {})
-        solution = f"This looks like a complex issue that may need investigation.\n\nWhile IT reviews this, you can try:\n1. Restart the affected application\n2. Check if others are experiencing the same issue\n3. Note any error messages you see\n\nI've created a ticket for IT to follow up."
-        confidence = 0.4
-        category = rec.get('category', 'General Support')
-        priority = rec.get('priority', 'Medium')
-        offer_escalate = False
-        ticket_status = 'New'
-        
-    elif response_type == 'status_check':
-        # User asking about ticket status - handle separately
+    if response_type == 'status_check':
+        # User asking about ticket status
         ticket_num = result.get('ticket_number')
         if ticket_num:
             ticket = await qb.get_ticket(ticket_num)
@@ -211,7 +184,7 @@ async def handle_support_question(
                 status_card = create_ticket_status_card(ticket)
                 await teams.send_card(activity, status_card)
             else:
-                await teams.send_message(activity, f"Ticket {ticket_num} not found.")
+                await teams.send_message(activity, f"Ticket {ticket_num} not found. Use /status to see your open tickets.")
         else:
             # Show user's tickets
             tickets = await qb.get_user_tickets(user_email)
@@ -221,50 +194,104 @@ async def handle_support_question(
             else:
                 await teams.send_message(activity, "You have no open tickets. Type your issue and I'll help!")
         return func.HttpResponse(status_code=200)
+    
+    elif response_type == 'command':
+        # Shouldn't hit this (commands handled separately) but just in case
+        return await handle_command(question, user_info, activity)
+    
+    else:
+        # 'solution' or 'error' - ALWAYS provide solution
+        solution = result.get('solution', '')
+        confidence = result.get('confidence', 0.5)
+        category = result.get('category', 'General Support')
+        priority = result.get('priority', 'Medium')
+        needs_human = result.get('needs_human', False)
+        sources = result.get('sources', [])
         
-    else:
-        # Fallback for any other type
-        solution = "I'll help you with that. Let me create a ticket to track this request."
-        confidence = 0.3
-        category = 'General Support'
-        priority = 'Medium'
-        offer_escalate = False
-        ticket_status = 'New'
+        # Ensure we always have a solution
+        if not solution or len(solution.strip()) < 10:
+            solution = get_fallback_response(question)
+            confidence = 0.3
+            needs_human = True
+        
+        # Determine ticket status based on confidence and needs_human flag
+        if needs_human or confidence < 0.5:
+            ticket_status = 'New'  # IT will review
+            ticket_priority = priority
+            offer_escalate = False  # Already getting IT attention
+        else:
+            ticket_status = 'Bot Assisted'  # Logged but low priority
+            ticket_priority = 'Low'
+            offer_escalate = True  # User can escalate if needed
+        
+        # ALWAYS send solution card to user
+        solution_card = create_solution_card(
+            solution=solution,
+            question=question,
+            category=category,
+            confidence=confidence,
+            offer_escalate=offer_escalate,
+            sources=sources
+        )
+        await teams.send_card(activity, solution_card)
+        
+        # ALWAYS create ticket for tracking
+        ticket_data = {
+            'subject': generate_subject(question),
+            'description': build_ticket_description(question, solution, sources, confidence),
+            'priority': ticket_priority,
+            'category': category,
+            'status': ticket_status,
+            'user_email': user_email,
+            'user_name': user_name
+        }
+        
+        ticket = await qb.create_ticket(ticket_data)
+        if ticket:
+            logging.info(f"Ticket created: {ticket.get('ticket_number')} (status: {ticket_status}, priority: {ticket_priority})")
+        else:
+            logging.error("Failed to create tracking ticket")
+        
+        return func.HttpResponse(status_code=200)
+
+
+def get_fallback_response(question: str) -> str:
+    """Fallback response when everything else fails"""
+    return f"""I'm having trouble processing your request, but here are some general steps:
+
+1. **Restart** the affected application or your computer
+2. **Check** if others are experiencing the same issue
+3. **Note** any error messages you see
+4. **Try** the web version if using a desktop app
+
+Your issue has been logged and IT will follow up: "{question[:80]}..."
+
+In the meantime, try /help for common solutions or /ticket to submit detailed information."""
+
+
+def build_ticket_description(question: str, solution: str, sources: list, confidence: float) -> str:
+    """Build comprehensive ticket description"""
+    sources_str = ", ".join(sources) if sources else "GPT General Knowledge"
     
-    # ALWAYS send solution card to user
-    solution_card = create_solution_card(
-        solution=solution,
-        question=question,
-        category=category,
-        confidence=confidence,
-        offer_escalate=offer_escalate
-    )
-    await teams.send_card(activity, solution_card)
-    
-    # ALWAYS create ticket for tracking
-    ticket_data = {
-        'subject': generate_subject(question),
-        'description': f"User question: {question}\n\n---\nBot response:\n{solution[:500]}",
-        'priority': priority if ticket_status == 'New' else 'Low',
-        'category': category,
-        'status': ticket_status,
-        'user_email': user_email,
-        'user_name': user_name
-    }
-    
-    ticket = await qb.create_ticket(ticket_data)
-    if ticket:
-        logging.info(f"Ticket created: {ticket.get('ticket_number')} (status: {ticket_status})")
-    else:
-        logging.error("Failed to create tracking ticket")
-    
-    return func.HttpResponse(status_code=200)
+    return f"""**User Question:**
+{question}
+
+---
+**Bot Response (Confidence: {confidence:.0%}):**
+{solution[:500]}{'...' if len(solution) > 500 else ''}
+
+---
+**Sources Used:** {sources_str}
+
+---
+*Auto-generated by IT Support Bot*"""
 
 
 def generate_subject(question: str) -> str:
     """Generate concise ticket subject from question"""
-    # Remove common words and limit length
-    words_to_remove = ['the', 'a', 'an', 'is', 'are', 'was', 'were', 'been', 'have', 'has', 'had', 'i', 'my', 'me', "can't", "cannot", "won't"]
+    words_to_remove = ['the', 'a', 'an', 'is', 'are', 'was', 'were', 'been', 
+                       'have', 'has', 'had', 'i', 'my', 'me', "can't", "cannot", 
+                       "won't", "please", "help", "need"]
     
     words = question.lower().split()
     filtered_words = [word for word in words if word not in words_to_remove]
@@ -277,14 +304,34 @@ def generate_subject(question: str) -> str:
     return subject or "IT Support Request"
 
 
-def create_solution_card(solution: str, question: str, category: str, confidence: float = 0.8, offer_escalate: bool = True) -> Dict:
+def create_solution_card(
+    solution: str, 
+    question: str, 
+    category: str, 
+    confidence: float = 0.8, 
+    offer_escalate: bool = True,
+    sources: list = None
+) -> Dict:
     """Create adaptive card for bot solution"""
+    
+    # Header based on confidence
+    if confidence >= 0.8:
+        header_text = "💡 Here's what I found:"
+        header_color = "good"
+    elif confidence >= 0.6:
+        header_text = "💡 This might help:"
+        header_color = "accent"
+    else:
+        header_text = "💡 While IT reviews this, try:"
+        header_color = "warning"
+    
     body = [
         {
             "type": "TextBlock",
-            "text": "💡 Here's what I found:",
+            "text": header_text,
             "weight": "Bolder",
-            "size": "Medium"
+            "size": "Medium",
+            "color": header_color
         },
         {
             "type": "TextBlock",
@@ -294,14 +341,25 @@ def create_solution_card(solution: str, question: str, category: str, confidence
         }
     ]
     
-    # Add confidence note if lower confidence
+    # Add confidence/status note
     if confidence < 0.7:
         body.append({
             "type": "TextBlock",
-            "text": "ℹ️ A ticket has been created. IT will follow up if needed.",
+            "text": "📋 A ticket has been created. IT will follow up if needed.",
             "wrap": True,
             "isSubtle": True,
             "spacing": "Medium",
+            "size": "Small"
+        })
+    
+    # Add sources if available (subtle)
+    if sources:
+        body.append({
+            "type": "TextBlock",
+            "text": f"_Sources: {', '.join(sources)}_",
+            "wrap": True,
+            "isSubtle": True,
+            "spacing": "Small",
             "size": "Small"
         })
     
@@ -465,9 +523,9 @@ async def handle_invoke(activity: Dict[str, Any]) -> func.HttpResponse:
                 "version": "1.5",
                 "body": [{
                     "type": "TextBlock",
-                    "text": "✅ Thanks for the feedback!",
+                    "text": "✅ Thanks for the feedback!" if helpful else "📝 Feedback noted. A ticket was created for IT follow-up.",
                     "weight": "Bolder",
-                    "color": "Good"
+                    "color": "Good" if helpful else "Accent"
                 }]
             }
             await teams.update_card(activity, thanks_card)
@@ -633,12 +691,22 @@ def create_ticket_list_card(tickets: list) -> Dict:
 @app.route(route="health", methods=["GET"], auth_level=func.AuthLevel.ANONYMOUS)
 async def health_check(req: func.HttpRequest) -> func.HttpResponse:
     """Health check endpoint"""
+    
+    # Check if chain can be initialized
+    chain_status = "unknown"
+    try:
+        chain = get_support_chain()
+        chain_status = "ok"
+    except Exception as e:
+        chain_status = f"error: {str(e)}"
+    
     return func.HttpResponse(
         json.dumps({
             "status": "healthy",
             "timestamp": datetime.utcnow().isoformat(),
-            "version": "1.0.0",
-            "architecture": "langchain",
+            "version": "2.0.0",
+            "architecture": "langchain-gpt",
+            "chain_status": chain_status,
             "modules": ["support_chain", "teams_handler", "quickbase_manager", "adaptive_cards"]
         }),
         mimetype="application/json",
