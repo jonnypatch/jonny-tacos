@@ -4,10 +4,10 @@ Uses LangChain ITSupportChain for routing and response generation.
 
 Flow:
 1. Route via LangChain → Classify intent
-2. Search vector store + static KB → Get relevant context  
+2. Search vector store + static KB → Get relevant context
 3. GPT ALWAYS generates response (with or without context)
 4. ALWAYS respond to user with solution
-5. ALWAYS create a ticket for tracking
+5. Create a ticket for tracking (skip for thread replies to avoid duplicates)
 """
 
 import azure.functions as func
@@ -98,25 +98,31 @@ async def handle_message(activity: Dict[str, Any]) -> func.HttpResponse:
     """Handle incoming text messages"""
     try:
         teams = get_teams_handler()
-        
+
         user_message = activity.get('text', '').strip()
         user_info = activity.get('from', {})
-        
+
         # Remove bot @mentions from message
         user_message = teams.remove_mentions(user_message)
-        
+
         if not user_message:
             return func.HttpResponse(status_code=200)
-        
+
         # Handle slash commands directly (fast path)
         if user_message.startswith('/'):
             return await handle_command(user_message, user_info, activity)
-        
+
+        # Check if this is a reply in an existing thread
+        # If replyToId exists, this is a follow-up message - don't create a new ticket
+        is_thread_reply = activity.get('replyToId') is not None
+        if is_thread_reply:
+            logging.info("Message is a reply in existing thread - will skip ticket creation")
+
         # Show typing indicator while processing
         await teams.send_typing_indicator(activity)
-        
+
         # Process through LangChain support chain
-        return await handle_support_question(user_message, user_info, activity)
+        return await handle_support_question(user_message, user_info, activity, skip_ticket=is_thread_reply)
         
     except Exception as e:
         logging.error(f"Error handling message: {str(e)}")
@@ -134,17 +140,18 @@ async def handle_message(activity: Dict[str, Any]) -> func.HttpResponse:
 # =============================================================================
 
 async def handle_support_question(
-    question: str, 
-    user_info: Dict, 
-    activity: Dict
+    question: str,
+    user_info: Dict,
+    activity: Dict,
+    skip_ticket: bool = False
 ) -> func.HttpResponse:
     """
     Process IT support question through LangChain.
-    
+
     ALWAYS:
     1. Generate a response (from vector store context or GPT directly)
     2. Send solution to user
-    3. Create a ticket for tracking
+    3. Create a ticket for tracking (unless skip_ticket=True for thread replies)
     """
     
     teams = get_teams_handler()
@@ -234,24 +241,27 @@ async def handle_support_question(
             sources=sources
         )
         await teams.send_card(activity, solution_card)
-        
-        # ALWAYS create ticket for tracking
-        ticket_data = {
-            'subject': generate_subject(question),
-            'description': build_ticket_description(question, solution, sources, confidence),
-            'priority': ticket_priority,
-            'category': category,
-            'status': ticket_status,
-            'user_email': user_email,
-            'user_name': user_name
-        }
-        
-        ticket = await qb.create_ticket(ticket_data)
-        if ticket:
-            logging.info(f"Ticket created: {ticket.get('ticket_number')} (status: {ticket_status}, priority: {ticket_priority})")
+
+        # Create ticket for tracking (skip for thread replies to avoid duplicates)
+        if skip_ticket:
+            logging.info("Skipping ticket creation - this is a reply in an existing thread")
         else:
-            logging.error("Failed to create tracking ticket")
-        
+            ticket_data = {
+                'subject': generate_subject(question),
+                'description': build_ticket_description(question, solution, sources, confidence),
+                'priority': ticket_priority,
+                'category': category,
+                'status': ticket_status,
+                'user_email': user_email,
+                'user_name': user_name
+            }
+
+            ticket = await qb.create_ticket(ticket_data)
+            if ticket:
+                logging.info(f"Ticket created: {ticket.get('ticket_number')} (status: {ticket_status}, priority: {ticket_priority})")
+            else:
+                logging.error("Failed to create tracking ticket")
+
         return func.HttpResponse(status_code=200)
 
 
