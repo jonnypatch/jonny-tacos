@@ -416,14 +416,188 @@ class TeamsHandler:
         try:
             # In production, implement proper JWT validation
             # This should verify the token with Microsoft's public keys
-            
+
             if not auth_header or not auth_header.startswith('Bearer '):
                 return False
-            
+
             # Add proper JWT validation here
             # For now, basic check
             return True
-            
+
         except Exception as e:
             logging.error(f"Error validating auth header: {str(e)}")
+            return False
+
+    async def send_notification_to_user(self, user_email: str, card: Dict[str, Any]) -> bool:
+        """
+        Send a proactive notification card to a user by their email address.
+
+        This creates a new 1:1 conversation with the user and sends the card.
+        Requires the bot to be installed for the user in Teams.
+
+        Args:
+            user_email: The user's email address (UPN)
+            card: The Adaptive Card to send
+
+        Returns:
+            bool: True if notification was sent successfully
+        """
+        try:
+            token = await self.get_auth_token()
+            if not token:
+                logging.error("Failed to get auth token for proactive message")
+                return False
+
+            headers = {
+                'Authorization': f'Bearer {token}',
+                'Content-Type': 'application/json'
+            }
+
+            # Step 1: Create a conversation with the user
+            # The bot needs to create a 1:1 chat to send proactive messages
+            create_conv_url = f"{self.service_url}v3/conversations"
+
+            conversation_params = {
+                'bot': {
+                    'id': self.app_id,
+                    'name': 'IT Support Bot'
+                },
+                'members': [
+                    {
+                        'id': user_email,  # User's email/UPN can be used as member ID
+                        'name': user_email
+                    }
+                ],
+                'channelData': {
+                    'tenant': {
+                        'id': self.tenant_id
+                    }
+                },
+                'isGroup': False
+            }
+
+            loop = asyncio.get_event_loop()
+
+            def create_conversation():
+                response = requests.post(
+                    create_conv_url,
+                    headers=headers,
+                    json=conversation_params,
+                    timeout=30
+                )
+                if response.status_code in [200, 201, 202]:
+                    return response.json()
+                else:
+                    logging.error(f"Failed to create conversation: {response.status_code} - {response.text}")
+                    return None
+
+            conv_response = await loop.run_in_executor(self.executor, create_conversation)
+
+            if not conv_response:
+                logging.error(f"Could not create conversation with user {user_email}")
+                return False
+
+            conversation_id = conv_response.get('id')
+            if not conversation_id:
+                logging.error("No conversation ID in response")
+                return False
+
+            # Step 2: Send the card to the conversation
+            message_url = f"{self.service_url}v3/conversations/{conversation_id}/activities"
+
+            message_activity = {
+                'type': 'message',
+                'from': {
+                    'id': self.app_id,
+                    'name': 'IT Support Bot'
+                },
+                'attachments': [{
+                    'contentType': 'application/vnd.microsoft.card.adaptive',
+                    'content': card
+                }]
+            }
+
+            def send_message():
+                response = requests.post(
+                    message_url,
+                    headers=headers,
+                    json=message_activity,
+                    timeout=30
+                )
+                return response.status_code in [200, 201, 202]
+
+            success = await loop.run_in_executor(self.executor, send_message)
+
+            if success:
+                logging.info(f"Successfully sent proactive notification to {user_email}")
+            else:
+                logging.error(f"Failed to send message to conversation {conversation_id}")
+
+            return success
+
+        except Exception as e:
+            logging.error(f"Error sending notification to user {user_email}: {str(e)}")
+            return False
+
+    async def send_notification_card_to_user(self, user_email: str, text: str) -> bool:
+        """
+        Send a simple text notification to a user by email.
+
+        Args:
+            user_email: The user's email address
+            text: The message text to send
+
+        Returns:
+            bool: True if sent successfully
+        """
+        try:
+            token = await self.get_auth_token()
+            if not token:
+                return False
+
+            headers = {
+                'Authorization': f'Bearer {token}',
+                'Content-Type': 'application/json'
+            }
+
+            create_conv_url = f"{self.service_url}v3/conversations"
+
+            conversation_params = {
+                'bot': {
+                    'id': self.app_id,
+                    'name': 'IT Support Bot'
+                },
+                'members': [
+                    {
+                        'id': user_email,
+                        'name': user_email
+                    }
+                ],
+                'channelData': {
+                    'tenant': {
+                        'id': self.tenant_id
+                    }
+                },
+                'isGroup': False,
+                'activity': {
+                    'type': 'message',
+                    'text': text
+                }
+            }
+
+            loop = asyncio.get_event_loop()
+
+            def send():
+                response = requests.post(
+                    create_conv_url,
+                    headers=headers,
+                    json=conversation_params,
+                    timeout=30
+                )
+                return response.status_code in [200, 201, 202]
+
+            return await loop.run_in_executor(self.executor, send)
+
+        except Exception as e:
+            logging.error(f"Error sending text notification to {user_email}: {str(e)}")
             return False

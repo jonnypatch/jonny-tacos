@@ -685,6 +685,267 @@ def create_ticket_list_card(tickets: list) -> Dict:
 
 
 # =============================================================================
+# QuickBase Webhook - Closed Ticket Notification
+# =============================================================================
+
+@app.route(route="webhook/ticket-closed", methods=["POST"], auth_level=func.AuthLevel.ANONYMOUS)
+async def webhook_ticket_closed(req: func.HttpRequest) -> func.HttpResponse:
+    """
+    Webhook endpoint for QuickBase to notify when a ticket is closed.
+
+    QuickBase Webhook Configuration:
+    1. Go to your QuickBase app settings
+    2. Navigate to Webhooks
+    3. Create a new webhook with:
+       - URL: https://your-function-app.azurewebsites.net/api/webhook/ticket-closed
+       - Method: POST
+       - Trigger: When record is modified
+       - Condition: Status field changes to "Closed"
+       - Include fields: ticket_number, subject, status, resolution, submitted_by (email)
+
+    Expected payload format:
+    {
+        "ticket_number": "IT-240101123456",
+        "subject": "Issue subject",
+        "status": "Closed",
+        "resolution": "Resolution details",
+        "submitted_by": "user@company.com",
+        "category": "General Support",
+        "priority": "Medium"
+    }
+    """
+    logging.info("Received QuickBase webhook for closed ticket")
+
+    try:
+        # Validate webhook secret if configured
+        webhook_secret = os.environ.get('QB_WEBHOOK_SECRET', '')
+        if webhook_secret:
+            provided_secret = req.headers.get('X-QB-Webhook-Secret', '')
+            if provided_secret != webhook_secret:
+                logging.warning("Invalid webhook secret provided")
+                return func.HttpResponse(
+                    json.dumps({"error": "Unauthorized"}),
+                    status_code=401,
+                    mimetype="application/json"
+                )
+
+        body = req.get_json()
+        logging.info(f"Webhook payload: {json.dumps(body)}")
+
+        # Handle QuickBase webhook format (may wrap data differently)
+        ticket_data = body
+        if 'data' in body:
+            ticket_data = body.get('data', {})
+        if isinstance(ticket_data, list) and len(ticket_data) > 0:
+            ticket_data = ticket_data[0]
+
+        # Extract ticket information
+        ticket_number = ticket_data.get('ticket_number', '')
+        status = ticket_data.get('status', '')
+        user_email = ticket_data.get('submitted_by', '')
+
+        # Only process if status is "Closed"
+        if status != 'Closed':
+            logging.info(f"Ticket {ticket_number} status is '{status}', not 'Closed'. Skipping notification.")
+            return func.HttpResponse(
+                json.dumps({"status": "skipped", "reason": "status not Closed"}),
+                status_code=200,
+                mimetype="application/json"
+            )
+
+        if not ticket_number:
+            logging.warning("No ticket_number in webhook payload")
+            return func.HttpResponse(
+                json.dumps({"error": "Missing ticket_number"}),
+                status_code=400,
+                mimetype="application/json"
+            )
+
+        if not user_email:
+            logging.warning(f"No user email for ticket {ticket_number}, cannot send notification")
+            return func.HttpResponse(
+                json.dumps({"status": "skipped", "reason": "no user email"}),
+                status_code=200,
+                mimetype="application/json"
+            )
+
+        # Send notification to user
+        notification_sent = await send_closed_ticket_notification(ticket_data, user_email)
+
+        if notification_sent:
+            logging.info(f"Closed ticket notification sent for {ticket_number} to {user_email}")
+            return func.HttpResponse(
+                json.dumps({"status": "success", "ticket_number": ticket_number, "notified": user_email}),
+                status_code=200,
+                mimetype="application/json"
+            )
+        else:
+            logging.warning(f"Failed to send notification for {ticket_number}")
+            return func.HttpResponse(
+                json.dumps({"status": "partial", "ticket_number": ticket_number, "notification_sent": False}),
+                status_code=200,
+                mimetype="application/json"
+            )
+
+    except ValueError as e:
+        logging.error(f"Invalid JSON in webhook payload: {str(e)}")
+        return func.HttpResponse(
+            json.dumps({"error": "Invalid JSON payload"}),
+            status_code=400,
+            mimetype="application/json"
+        )
+    except Exception as e:
+        logging.error(f"Error processing webhook: {str(e)}")
+        return func.HttpResponse(
+            json.dumps({"error": str(e)}),
+            status_code=500,
+            mimetype="application/json"
+        )
+
+
+async def send_closed_ticket_notification(ticket_data: Dict[str, Any], user_email: str) -> bool:
+    """
+    Send a Teams notification to the user that their ticket has been closed.
+
+    Uses proactive messaging to reach the user directly.
+    """
+    try:
+        teams = get_teams_handler()
+        cards = get_card_builder()
+
+        # Create the closed ticket notification card
+        notification_card = create_closed_ticket_card(ticket_data)
+
+        # Send proactive message to user
+        # Note: For proactive messaging to work, the bot must have had a prior conversation with the user
+        success = await teams.send_notification_to_user(user_email, notification_card)
+
+        return success
+
+    except Exception as e:
+        logging.error(f"Error sending closed ticket notification: {str(e)}")
+        return False
+
+
+def create_closed_ticket_card(ticket_data: Dict[str, Any]) -> Dict:
+    """Create adaptive card for closed ticket notification"""
+    ticket_number = ticket_data.get('ticket_number', 'N/A')
+    subject = ticket_data.get('subject', 'No Subject')
+    resolution = ticket_data.get('resolution', 'No resolution details provided.')
+    category = ticket_data.get('category', 'General Support')
+    priority = ticket_data.get('priority', 'Medium')
+
+    priority_icons = {'Critical': '🔴', 'High': '🟠', 'Medium': '🟡', 'Low': '🟢'}
+    priority_icon = priority_icons.get(priority, '⚪')
+
+    return {
+        "$schema": "http://adaptivecards.io/schemas/adaptive-card.json",
+        "type": "AdaptiveCard",
+        "version": "1.5",
+        "body": [
+            {
+                "type": "Container",
+                "style": "emphasis",
+                "items": [
+                    {
+                        "type": "ColumnSet",
+                        "columns": [
+                            {
+                                "type": "Column",
+                                "width": "auto",
+                                "items": [
+                                    {
+                                        "type": "TextBlock",
+                                        "text": "✅",
+                                        "size": "ExtraLarge"
+                                    }
+                                ]
+                            },
+                            {
+                                "type": "Column",
+                                "width": "stretch",
+                                "items": [
+                                    {
+                                        "type": "TextBlock",
+                                        "text": "Ticket Closed",
+                                        "weight": "Bolder",
+                                        "size": "Large",
+                                        "color": "Good"
+                                    },
+                                    {
+                                        "type": "TextBlock",
+                                        "text": f"Your ticket #{ticket_number} has been resolved",
+                                        "size": "Medium",
+                                        "isSubtle": True,
+                                        "wrap": True
+                                    }
+                                ]
+                            }
+                        ]
+                    }
+                ]
+            },
+            {
+                "type": "Container",
+                "separator": True,
+                "spacing": "Medium",
+                "items": [
+                    {
+                        "type": "FactSet",
+                        "facts": [
+                            {"title": "Subject:", "value": subject[:50] + ('...' if len(subject) > 50 else '')},
+                            {"title": "Category:", "value": category},
+                            {"title": "Priority:", "value": f"{priority_icon} {priority}"},
+                            {"title": "Status:", "value": "✅ Closed"}
+                        ]
+                    }
+                ]
+            },
+            {
+                "type": "Container",
+                "separator": True,
+                "spacing": "Medium",
+                "items": [
+                    {
+                        "type": "TextBlock",
+                        "text": "**Resolution:**",
+                        "weight": "Bolder"
+                    },
+                    {
+                        "type": "TextBlock",
+                        "text": resolution[:500] + ('...' if len(resolution) > 500 else ''),
+                        "wrap": True,
+                        "spacing": "Small"
+                    }
+                ]
+            },
+            {
+                "type": "TextBlock",
+                "text": "If you have any further questions or the issue persists, please create a new ticket.",
+                "wrap": True,
+                "isSubtle": True,
+                "spacing": "Large",
+                "size": "Small"
+            }
+        ],
+        "actions": [
+            {
+                "type": "Action.Submit",
+                "title": "Create New Ticket",
+                "data": {
+                    "action": "create_ticket_form"
+                }
+            },
+            {
+                "type": "Action.OpenUrl",
+                "title": "View in QuickBase",
+                "url": ticket_data.get('quickbase_url', '#')
+            }
+        ]
+    }
+
+
+# =============================================================================
 # Health Check
 # =============================================================================
 
